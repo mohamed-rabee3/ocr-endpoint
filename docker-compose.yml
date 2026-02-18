@@ -1,0 +1,12 @@
+services:
+  ocr-api:
+    build: .
+    image: ocr-api:latest
+    container_name: ocr-api
+    ports:
+      - "8567:8567"
+    env_file: .env
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    restart: unless-stopped
