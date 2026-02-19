@@ -3,21 +3,22 @@ import json
 import os
 from typing import List, Literal, Optional, Union
 
-import numpy as np
+from json_repair import repair_json
+
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from starlette.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from pdf2image import convert_from_bytes
 from pydantic import BaseModel, Field, ValidationError
 from PIL import Image
-import cv2
 
 
 # Load environment variables from .env (with .env taking precedence if both are set)
 load_dotenv(override=True)
 
-GEMINI_MODEL_NAME = "gemini-2.5-flash"
+GEMINI_MODEL_NAME = "gemini-3-flash-preview"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
@@ -83,12 +84,21 @@ class OcrMetadata(BaseModel):
 class OcrResponse(BaseModel):
     pages: List[Page]
     metadata: OcrMetadata
+    markdown: str = ""
 
 
 app = FastAPI(
     title="Invoice OCR API",
-    description="OCR invoice images via Gemini 2.5 Flash (Google AI).",
+    description="OCR invoice images via Gemini 3 Flash (Google AI).",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -112,18 +122,6 @@ def pdf_bytes_to_images(data: bytes, max_pages: int) -> List[Image.Image]:
     return images
 
 
-def preprocess_image(pil_img: Image.Image) -> Image.Image:
-    rgb = pil_img.convert("RGB")
-    np_img = np.array(rgb)
-
-    gray = cv2.cvtColor(np_img, cv2.COLOR_RGB2GRAY)
-
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
-
-    return Image.fromarray(enhanced, mode="L")
-
-
 def _ensure_gemini_api_key() -> str:
     if not GEMINI_API_KEY:
         raise HTTPException(
@@ -135,7 +133,7 @@ def _ensure_gemini_api_key() -> str:
 
 def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     """
-    Run Gemini 2.5 Flash on a single image and return JSON with elements (bbox, category, text).
+    Run Gemini 3 Flash on a single image and return JSON with elements (bbox, category, text).
     """
     _ensure_gemini_api_key()
 
@@ -143,7 +141,7 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     pil_img.save(buffer, format="PNG")
     image_bytes = buffer.getvalue()
 
-    prompt = """Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+    prompt = """Please output the layout information from the image as a single JSON object. You MUST include both the structured elements AND a complete markdown representation of the document (translated) in the same JSON output.
 
 1. Bbox format: [x1, y1, x2, y2]
 
@@ -164,7 +162,9 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
 5. Constraints:
     - All layout elements must be sorted according to human reading order.
 
-6. Final Output: The entire output must be a single JSON object with an "elements" array, where each element has "bbox", "category", and "text" (omit "text" for Picture).
+6. Final Output: Output ONLY a single JSON object. It MUST contain both:
+   - "elements": array where each element has "bbox", "category", and "text" (omit "text" for Picture).
+   - "markdown": a string containing the complete document content as markdown, translated to Arabic. This must be the full readable document in markdown format with proper structure (headers, lists, tables as markdown tables). Do not omit the markdown field.
 """
 
     try:
@@ -190,18 +190,41 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
 
     output_text = response.candidates[0].content.parts[0].text or ""
 
+    output_text = output_text.strip()
+
+    # Strip any surrounding markdown code fences (```json ... ```)
+    if output_text.startswith("```"):
+        lines = output_text.splitlines()
+        output_text = "\n".join(
+            line for line in lines if not line.strip().startswith("```")
+        ).strip()
+
+    # Extract the outermost JSON object
+    start_idx = output_text.find("{")
+    end_idx = output_text.rfind("}") + 1
+    if start_idx >= 0 and end_idx > start_idx:
+        candidate = output_text[start_idx:end_idx]
+    else:
+        candidate = output_text
+
+    # Try strict parse first, fall back to json_repair
     try:
-        output_text = output_text.strip()
-        start_idx = output_text.find("{")
-        end_idx = output_text.rfind("}") + 1
-        if start_idx >= 0 and end_idx > start_idx:
-            return json.loads(output_text[start_idx:end_idx])
-        raise ValueError("No JSON object found in output")
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini returned non-JSON output: {exc}. Raw: {output_text[:500]}",
-        )
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        try:
+            repaired = repair_json(candidate)
+            parsed = json.loads(repaired)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gemini returned non-JSON output that could not be repaired: {exc}. Raw: {output_text[:500]}",
+            ) from exc
+
+    # Fix literal \n escape sequences in markdown field
+    if "markdown" in parsed and isinstance(parsed["markdown"], str):
+        parsed["markdown"] = parsed["markdown"].replace("\\n", "\n")
+
+    return parsed
 
 
 @app.post(
@@ -211,8 +234,7 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     summary="Run OCR on an invoice image",
     description=(
         "Upload an invoice as an image. "
-        "Images will be preprocessed (grayscale + contrast enhancement) "
-        "and then sent to Gemini 2.5 Flash. "
+        "Images are sent to Gemini 3 Flash for OCR. "
         "Returns a detailed JSON layout including text blocks and tables."
     ),
 )
@@ -254,14 +276,16 @@ async def ocr_invoice(
         raise HTTPException(status_code=400, detail=f"Failed to open image: {exc}") from exc
     images = [img]
 
-    preprocessed_images = [preprocess_image(img) for img in images]
-
-    # Run Gemini 2.5 Flash on each page and convert output to our schema
+    # Run Gemini 3 Flash on each page and convert output to our schema
     pages: List[Page] = []
-    for idx, img in enumerate(preprocessed_images, start=1):
+    markdown_parts: List[str] = []
+    for idx, img in enumerate(images, start=1):
         ocr_output = run_gemini_ocr_on_image(img, page_number=idx)
         page = convert_elements_to_page(ocr_output, page_number=idx, img_width=img.width, img_height=img.height)
         pages.append(page)
+        page_markdown = ocr_output.get("markdown", "")
+        if page_markdown:
+            markdown_parts.append(page_markdown)
 
     metadata = OcrMetadata(
         source_type=source_type,
@@ -269,7 +293,37 @@ async def ocr_invoice(
         processed_pages=len(pages),
     )
 
-    return OcrResponse(pages=pages, metadata=metadata)
+    return OcrResponse(
+        pages=pages,
+        metadata=metadata,
+        markdown="\n\n".join(markdown_parts),
+    )
+
+
+def _parse_bbox(bbox_list: list, img_width: int, img_height: int) -> BoundingBox:
+    if len(bbox_list) != 4:
+        return BoundingBox(x_min=0, y_min=0, x_max=img_width, y_max=img_height)
+
+    x1, y1, x2, y2 = [float(v) for v in bbox_list]
+
+    # If all values are in [0, 1], treat as normalized and convert to pixels
+    if all(0.0 <= v <= 1.0 for v in [x1, y1, x2, y2]):
+        x1, y1 = x1 * img_width, y1 * img_height
+        x2, y2 = x2 * img_width, y2 * img_height
+
+    # Ensure correct ordering
+    x_min = int(min(x1, x2))
+    x_max = int(max(x1, x2))
+    y_min = int(min(y1, y2))
+    y_max = int(max(y1, y2))
+
+    # Clamp to image bounds
+    x_min = max(0, min(x_min, img_width))
+    x_max = max(0, min(x_max, img_width))
+    y_min = max(0, min(y_min, img_height))
+    y_max = max(0, min(y_max, img_height))
+
+    return BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max)
 
 
 def convert_elements_to_page(ocr_output: dict, page_number: int, img_width: int, img_height: int) -> Page:
@@ -281,14 +335,7 @@ def convert_elements_to_page(ocr_output: dict, page_number: int, img_width: int,
     
     for idx, elem in enumerate(elements):
         bbox_list = elem.get("bbox", [0, 0, 0, 0])
-        if len(bbox_list) != 4:
-            bbox_list = [0, 0, 0, 0]
-        bbox = BoundingBox(
-            x_min=int(bbox_list[0]),
-            y_min=int(bbox_list[1]),
-            x_max=int(bbox_list[2]),
-            y_max=int(bbox_list[3]),
-        )
+        bbox = _parse_bbox(bbox_list, img_width, img_height)
         category = elem.get("category", "Text")
         text_content = elem.get("text", "")
         

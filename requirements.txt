@@ -7,3 +7,4 @@ Pillow
 python-multipart
 python-dotenv
 google-genai
+json-repair
