@@ -85,6 +85,7 @@ class OcrResponse(BaseModel):
     pages: List[Page]
     metadata: OcrMetadata
     markdown: str = ""
+    csv: str = ""
 
 
 app = FastAPI(
@@ -141,7 +142,7 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     pil_img.save(buffer, format="PNG")
     image_bytes = buffer.getvalue()
 
-    prompt = """Please output the layout information from the image as a single JSON object. You MUST include both the structured elements AND a complete markdown representation of the document (translated) in the same JSON output.
+    prompt = """Please output the layout information from the image as a single JSON object. You MUST include the structured elements, a complete markdown representation, AND a CSV extraction of invoice fields in the same JSON output.
 
 1. Bbox format: [x1, y1, x2, y2]
 
@@ -154,17 +155,25 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     - All Others (Text, Title, etc.): Format their text as Markdown.
 
 4. Translation Rules:
-    - Translate all English and Chinese words to Arabic.
+    - Keep all English text as-is.
+    - Translate all Chinese and Arabic text to English.
     - Keep all numbers (digits 0-9) exactly as they appear in the original image, do not translate or convert them.
-    - Preserve any Arabic text as-is.
     - Maintain the original formatting and structure.
 
 5. Constraints:
     - All layout elements must be sorted according to human reading order.
 
-6. Final Output: Output ONLY a single JSON object. It MUST contain both:
+6. CSV Extraction:
+    - Extract invoice-specific fields into a CSV string.
+    - The CSV header row MUST be: invoice_number,date,unit_price,total_price,quantity,item,model,country_of_origin,country_of_export
+    - If there are multiple line items, output one CSV row per item.
+    - If a field is not found in the document, leave it empty (e.g. ,,).
+    - All values must be in English. Translate any non-English values to English.
+
+7. Final Output: Output ONLY a single JSON object. It MUST contain all three:
    - "elements": array where each element has "bbox", "category", and "text" (omit "text" for Picture).
-   - "markdown": a string containing the complete document content as markdown, translated to Arabic. This must be the full readable document in markdown format with proper structure (headers, lists, tables as markdown tables). Do not omit the markdown field.
+   - "markdown": a string containing the complete document content as markdown, in English. This must be the full readable document in markdown format with proper structure (headers, lists, tables as markdown tables). Do not omit the markdown field.
+   - "csv": a string containing the CSV data with the header row and one or more data rows. Do not omit the csv field.
 """
 
     try:
@@ -220,9 +229,11 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
                 detail=f"Gemini returned non-JSON output that could not be repaired: {exc}. Raw: {output_text[:500]}",
             ) from exc
 
-    # Fix literal \n escape sequences in markdown field
+    # Fix literal \n escape sequences in markdown and csv fields
     if "markdown" in parsed and isinstance(parsed["markdown"], str):
         parsed["markdown"] = parsed["markdown"].replace("\\n", "\n")
+    if "csv" in parsed and isinstance(parsed["csv"], str):
+        parsed["csv"] = parsed["csv"].replace("\\n", "\n")
 
     return parsed
 
@@ -276,9 +287,12 @@ async def ocr_invoice(
         raise HTTPException(status_code=400, detail=f"Failed to open image: {exc}") from exc
     images = [img]
 
+    CSV_HEADER = "invoice_number,date,unit_price,total_price,quantity,item,model,country_of_origin,country_of_export"
+
     # Run Gemini 3 Flash on each page and convert output to our schema
     pages: List[Page] = []
     markdown_parts: List[str] = []
+    csv_rows: List[str] = []
     for idx, img in enumerate(images, start=1):
         ocr_output = run_gemini_ocr_on_image(img, page_number=idx)
         page = convert_elements_to_page(ocr_output, page_number=idx, img_width=img.width, img_height=img.height)
@@ -286,6 +300,15 @@ async def ocr_invoice(
         page_markdown = ocr_output.get("markdown", "")
         if page_markdown:
             markdown_parts.append(page_markdown)
+        page_csv = ocr_output.get("csv", "")
+        if page_csv:
+            for line in page_csv.strip().splitlines():
+                if line.strip().lower() == CSV_HEADER.lower():
+                    continue
+                if line.strip():
+                    csv_rows.append(line.strip())
+
+    csv_output = CSV_HEADER + "\n" + "\n".join(csv_rows) if csv_rows else CSV_HEADER
 
     metadata = OcrMetadata(
         source_type=source_type,
@@ -297,6 +320,7 @@ async def ocr_invoice(
         pages=pages,
         metadata=metadata,
         markdown="\n\n".join(markdown_parts),
+        csv=csv_output,
     )
 
 

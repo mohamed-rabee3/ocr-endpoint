@@ -20,7 +20,7 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```text
-OPENROUTER_API_KEY=your_api_key_here
+GEMINI_API_KEY=your_api_key_here
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
 
