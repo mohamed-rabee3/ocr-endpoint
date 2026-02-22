@@ -1,6 +1,9 @@
+import asyncio
 import io
+import itertools
 import json
 import os
+import threading
 from typing import List, Literal, Optional, Union
 
 from json_repair import repair_json
@@ -19,7 +22,29 @@ from PIL import Image
 load_dotenv(override=True)
 
 GEMINI_MODEL_NAME = "gemini-3-flash-preview"
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+def _load_gemini_api_keys() -> List[str]:
+    keys = []
+    # Check for comma-separated keys
+    keys_str = os.getenv("GEMINI_API_KEYS")
+    if keys_str:
+        keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    if not keys:
+        # Check for GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.
+        for i in range(1, 10):
+            key = os.getenv(f"GEMINI_API_KEY_{i}") or os.getenv(f"GEMINI_API_KEY{i}")
+            if key:
+                keys.append(key.strip())
+    if not keys:
+        # Fallback to single key
+        single_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        if single_key:
+            keys.append(single_key.strip())
+    return keys
+
+GEMINI_API_KEYS = _load_gemini_api_keys()
+_api_key_cycle = itertools.cycle(GEMINI_API_KEYS) if GEMINI_API_KEYS else None
+_api_key_lock = threading.Lock()
 
 
 class BoundingBox(BaseModel):
@@ -123,20 +148,21 @@ def pdf_bytes_to_images(data: bytes, max_pages: int) -> List[Image.Image]:
     return images
 
 
-def _ensure_gemini_api_key() -> str:
-    if not GEMINI_API_KEY:
+def _get_next_api_key() -> str:
+    if not _api_key_cycle:
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY or GOOGLE_API_KEY is not set in the environment.",
+            detail="No Gemini API keys are set in the environment. Please set GEMINI_API_KEYS, or GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.",
         )
-    return GEMINI_API_KEY
+    with _api_key_lock:
+        return next(_api_key_cycle)
 
 
 def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     """
     Run Gemini 3 Flash on a single image and return JSON with elements (bbox, category, text).
     """
-    _ensure_gemini_api_key()
+    api_key = _get_next_api_key()
 
     buffer = io.BytesIO()
     pil_img.save(buffer, format="PNG")
@@ -177,7 +203,7 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
 """
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        client = genai.Client(api_key=api_key)
         image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
         response = client.models.generate_content(
             model=GEMINI_MODEL_NAME,
@@ -238,34 +264,20 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
     return parsed
 
 
-@app.post(
-    "/ocr",
-    response_model=OcrResponse,
-    tags=["OCR"],
-    summary="Run OCR on an invoice image",
-    description=(
-        "Upload an invoice as an image. "
-        "Images are sent to Gemini 3 Flash for OCR. "
-        "Returns a detailed JSON layout including text blocks and tables."
-    ),
-)
-async def ocr_invoice(
-    file: UploadFile = File(..., description="Invoice image."),
-    max_pages: int = 5,
-) -> OcrResponse:
+async def process_invoice_file(file: UploadFile, max_pages: int) -> OcrResponse:
     if max_pages <= 0:
         raise HTTPException(status_code=400, detail="max_pages must be positive.")
 
     content_type = (file.content_type or "").lower()
-    filename = file.filename or ""
+    filename = file.filename or "unknown_file"
 
     try:
         contents = await file.read()
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file '{filename}': {exc}") from exc
 
     if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        raise HTTPException(status_code=400, detail=f"Uploaded file '{filename}' is empty.")
 
     is_image = content_type.startswith("image/") or any(
         filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".tiff", ".bmp")
@@ -284,7 +296,7 @@ async def ocr_invoice(
     try:
         img = Image.open(io.BytesIO(contents))
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to open image: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Failed to open image '{filename}': {exc}") from exc
     images = [img]
 
     CSV_HEADER = "invoice_number,date,unit_price,total_price,quantity,item,model,country_of_origin,country_of_export"
@@ -294,7 +306,7 @@ async def ocr_invoice(
     markdown_parts: List[str] = []
     csv_rows: List[str] = []
     for idx, img in enumerate(images, start=1):
-        ocr_output = run_gemini_ocr_on_image(img, page_number=idx)
+        ocr_output = await asyncio.to_thread(run_gemini_ocr_on_image, img, page_number=idx)
         page = convert_elements_to_page(ocr_output, page_number=idx, img_width=img.width, img_height=img.height)
         pages.append(page)
         page_markdown = ocr_output.get("markdown", "")
@@ -322,6 +334,47 @@ async def ocr_invoice(
         markdown="\n\n".join(markdown_parts),
         csv=csv_output,
     )
+
+
+@app.post(
+    "/ocr",
+    response_model=OcrResponse,
+    tags=["OCR"],
+    summary="Run OCR on an invoice image",
+    description=(
+        "Upload an invoice as an image. "
+        "Images are sent to Gemini 3 Flash for OCR. "
+        "Returns a detailed JSON layout including text blocks and tables."
+    ),
+)
+async def ocr_invoice(
+    file: UploadFile = File(..., description="Invoice image."),
+    max_pages: int = 5,
+) -> OcrResponse:
+    return await process_invoice_file(file, max_pages)
+
+
+@app.post(
+    "/ocr/bulk",
+    response_model=List[OcrResponse],
+    tags=["OCR"],
+    summary="Run OCR on multiple invoice images in parallel",
+    description=(
+        "Upload multiple invoice images. "
+        "Images are sent to Gemini 3 Flash for OCR in parallel. "
+        "Returns a list of detailed JSON layouts including text blocks and tables."
+    ),
+)
+async def ocr_invoice_bulk(
+    files: List[UploadFile] = File(..., description="List of invoice images."),
+    max_pages: int = 5,
+) -> List[OcrResponse]:
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+        
+    tasks = [process_invoice_file(file, max_pages) for file in files]
+    responses = await asyncio.gather(*tasks)
+    return list(responses)
 
 
 def _parse_bbox(bbox_list: list, img_width: int, img_height: int) -> BoundingBox:
