@@ -43,8 +43,38 @@ def _load_gemini_api_keys() -> List[str]:
     return keys
 
 GEMINI_API_KEYS = _load_gemini_api_keys()
-_api_key_cycle = itertools.cycle(GEMINI_API_KEYS) if GEMINI_API_KEYS else None
-_api_key_lock = threading.Lock()
+
+
+class ApiKeyPool:
+    def __init__(self, keys: List[str]):
+        self.all_keys = keys
+        self.active_keys = set(keys)
+        self.current_idx = 0
+        self.lock = threading.Lock()
+
+    def get_key(self) -> str:
+        with self.lock:
+            if not self.active_keys:
+                raise HTTPException(
+                    status_code=429,
+                    detail="All Gemini API keys have exceeded their quota. Please try again later.",
+                )
+            # Find the next active key
+            for _ in range(len(self.all_keys)):
+                key = self.all_keys[self.current_idx]
+                self.current_idx = (self.current_idx + 1) % len(self.all_keys)
+                if key in self.active_keys:
+                    return key
+            raise HTTPException(status_code=429, detail="No active keys available.")
+
+    def disable_key(self, key: str):
+        with self.lock:
+            if key in self.active_keys:
+                self.active_keys.remove(key)
+                print(f"API key ending in ...{key[-4:]} disabled due to 429 error. {len(self.active_keys)} keys remaining.")
+
+
+_api_key_pool = ApiKeyPool(GEMINI_API_KEYS)
 
 
 class BoundingBox(BaseModel):
@@ -106,11 +136,22 @@ class OcrMetadata(BaseModel):
     processed_pages: int
 
 
+class LineItem(BaseModel):
+    company_from: str = ""
+    company_to: str = ""
+    invoice_number: str = ""
+    goods_products: str = ""
+    quantity: str = ""
+    unit_price: str = ""
+    whole_price_amount: str = ""
+    total_price: str = ""
+
+
 class OcrResponse(BaseModel):
     pages: List[Page]
     metadata: OcrMetadata
     markdown: str = ""
-    csv: str = ""
+    line_items: List[LineItem] = Field(default_factory=list)
 
 
 app = FastAPI(
@@ -149,13 +190,12 @@ def pdf_bytes_to_images(data: bytes, max_pages: int) -> List[Image.Image]:
 
 
 def _get_next_api_key() -> str:
-    if not _api_key_cycle:
+    if not _api_key_pool.all_keys:
         raise HTTPException(
             status_code=500,
             detail="No Gemini API keys are set in the environment. Please set GEMINI_API_KEYS, or GEMINI_API_KEY_1, GEMINI_API_KEY_2, etc.",
         )
-    with _api_key_lock:
-        return next(_api_key_cycle)
+    return _api_key_pool.get_key()
 
 
 def _parse_gemini_json(output_text: str) -> dict:
@@ -191,6 +231,51 @@ def _parse_gemini_json(output_text: str) -> dict:
             ) from exc
 
     return parsed
+
+
+def _extract_response_text(response) -> str:
+    """
+    Extract the actual text response from a Gemini response,
+    skipping any 'thought' parts (returned when thinking is enabled).
+    """
+    if not response.candidates or not response.candidates[0].content.parts:
+        return ""
+    for part in response.candidates[0].content.parts:
+        # Skip thinking parts (they have a 'thought' attribute set to True)
+        if getattr(part, "thought", False):
+            continue
+        if part.text:
+            return part.text
+    return ""
+
+
+LINE_ITEM_FIELDS = ["company_from", "company_to", "invoice_number", "goods_products", "quantity", "unit_price", "whole_price_amount", "total_price"]
+
+
+def _normalize_line_items(raw_items: list) -> List[dict]:
+    """Sanitize line items: strip $ from prices, ensure all fields present."""
+    result = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        cleaned = {}
+        for field in LINE_ITEM_FIELDS:
+            val = str(item.get(field, "")).strip()
+            # Strip $ and commas from price fields
+            if field in ("unit_price", "whole_price_amount", "total_price") and val:
+                # Remove currency prefixes like $, US$, USD
+                for prefix in ("US$", "USD", "$"):
+                    if val.upper().startswith(prefix.upper()):
+                        val = val[len(prefix):].strip()
+                        break
+                try:
+                    float(val.replace(",", ""))
+                    val = val.replace(",", "")
+                except (ValueError, AttributeError):
+                    pass  # Keep non-numeric values like "FOC" as-is
+            cleaned[field] = val
+        result.append(cleaned)
+    return result
 
 
 def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
@@ -232,28 +317,43 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
    - "markdown": a string containing the complete document content as markdown, in English. This must be the full readable document in markdown format with proper structure (headers, lists, tables as markdown tables). Do not omit the markdown field.
 """
 
-    try:
-        client = genai.Client(api_key=api_key)
-        image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
-        layout_response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=[image_part, layout_prompt],
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=0
-                )
-            ),
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gemini API error (layout pass): {exc}",
-        ) from exc
+    # Retry loop for API keys
+    max_retries = len(_api_key_pool.all_keys) if _api_key_pool.all_keys else 1
+    
+    # ── Pass 1: Layout + Markdown extraction ──────────────────────────────
+    for attempt in range(max_retries):
+        api_key = _get_next_api_key()
+        try:
+            client = genai.Client(api_key=api_key)
+            image_part = types.Part.from_bytes(data=image_bytes, mime_type="image/png")
+            layout_response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=[image_part, layout_prompt],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=0
+                    )
+                ),
+            )
+            break  # Success
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "quota" in err_msg.lower():
+                _api_key_pool.disable_key(api_key)
+                if attempt == max_retries - 1:
+                    raise HTTPException(status_code=429, detail="All Gemini API keys exhausted quota (layout pass).")
+                continue # Try next key
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Gemini API error (layout pass): {exc}",
+                ) from exc
+    else:
+        raise HTTPException(status_code=502, detail="Request failed after exhausting all API keys.")
 
-    if not layout_response.candidates or not layout_response.candidates[0].content.parts:
+    layout_text = _extract_response_text(layout_response)
+    if not layout_text:
         raise HTTPException(status_code=502, detail="Gemini returned empty response (layout pass).")
-
-    layout_text = layout_response.candidates[0].content.parts[0].text or ""
     parsed = _parse_gemini_json(layout_text)
 
     # Fix literal \n escape sequences in markdown
@@ -262,19 +362,26 @@ def run_gemini_ocr_on_image(pil_img: Image.Image, page_number: int) -> dict:
 
     markdown_content = parsed.get("markdown", "")
 
-    # ── Pass 2: CSV extraction grounded on the markdown ───────────────────
-    csv_prompt = f"""Extract invoice line-item data from this document into CSV format.
+    # ── Pass 2: Line-item extraction grounded on the markdown ──────────────
+    items_prompt = f"""Extract invoice line-item data from this document as a JSON array.
 
 Use the REFERENCE TEXT below as your primary source. Cross-reference with the image to verify.
 
-CSV header row (use exactly this):
-invoice_number,date,unit_price,total_price,quantity,item,model,country_of_origin,country_of_export
+Each line item must be a JSON object with exactly these fields:
+- "company_from": the seller/shipper/consignor company name (from the document header). Use a short name.
+- "company_to": the buyer/consignee company name (from the document header). Use a short name.
+- "invoice_number": the invoice number from the document header
+- "goods_products": description of the goods/product for this line item
+- "quantity": the quantity
+- "unit_price": the unit price for this line item (number only, no currency symbol)
+- "whole_price_amount": the line-item total / amount (number only, no currency symbol). If "FOC" or "Free", keep as-is.
+- "total_price": the invoice grand total (same value on every row, number only, no currency symbol)
 
 Rules:
-- One CSV row per line item found in the invoice.
-- The invoice_number and date should come from the document header (e.g. Invoice No., Date fields). Include them on each row.
+- One object per line item found in the invoice. Do NOT include total/summary rows.
+- company_from, company_to, invoice_number, and total_price are document-level fields — repeat them on every item.
 - Copy numbers exactly as they appear in the document. Do not recalculate or reformat.
-- If a field does not exist in the document, leave it empty (consecutive commas).
+- If a field does not exist in the document, set it to an empty string "".
 - If a value is "FOC", "Free", "N/A" etc., keep it as-is.
 - Translate non-English item descriptions to English.
 - Do NOT invent or guess values that are not in the document.
@@ -284,34 +391,49 @@ REFERENCE TEXT:
 {markdown_content}
 ---
 
-Output ONLY a JSON object with a single key "csv" containing the full CSV string (header + data rows, rows separated by newlines).
-You MUST include at least the header and one data row if the document contains any line items.
+Output ONLY a JSON object with a single key "line_items" containing the array of line item objects.
+You MUST include at least one item if the document contains any line items.
 """
 
-    try:
-        csv_response = client.models.generate_content(
-            model=GEMINI_MODEL_NAME,
-            contents=[image_part, csv_prompt],
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=1024
-                )
-            ),
-        )
-    except Exception as exc:
-        # If CSV pass fails, return layout data without CSV rather than failing entirely
-        parsed["csv"] = ""
+    for attempt in range(max_retries):
+        api_key = _get_next_api_key()
+        try:
+            client = genai.Client(api_key=api_key)
+            items_response = client.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents=[image_part, items_prompt],
+                config=types.GenerateContentConfig(
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=1024
+                    )
+                ),
+            )
+            break  # Success
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "quota" in err_msg.lower():
+                _api_key_pool.disable_key(api_key)
+                if attempt == max_retries - 1:
+                    parsed["line_items"] = []
+                    return parsed
+                continue # Try next key
+            else:
+                parsed["line_items"] = []
+                return parsed
+    else:
+        parsed["line_items"] = []
         return parsed
 
-    if csv_response.candidates and csv_response.candidates[0].content.parts:
-        csv_text = csv_response.candidates[0].content.parts[0].text or ""
-        csv_parsed = _parse_gemini_json(csv_text)
-        csv_value = csv_parsed.get("csv", "")
-        if isinstance(csv_value, str):
-            csv_value = csv_value.replace("\\n", "\n")
-        parsed["csv"] = csv_value
+    items_text = _extract_response_text(items_response)
+    if items_text:
+        items_parsed = _parse_gemini_json(items_text)
+        raw_items = items_parsed.get("line_items", [])
+        if isinstance(raw_items, list):
+            parsed["line_items"] = _normalize_line_items(raw_items)
+        else:
+            parsed["line_items"] = []
     else:
-        parsed["csv"] = ""
+        parsed["line_items"] = []
 
     return parsed
 
@@ -351,12 +473,10 @@ async def process_invoice_file(file: UploadFile, max_pages: int) -> OcrResponse:
         raise HTTPException(status_code=400, detail=f"Failed to open image '{filename}': {exc}") from exc
     images = [img]
 
-    CSV_HEADER = "invoice_number,date,unit_price,total_price,quantity,item,model,country_of_origin,country_of_export"
-
     # Run Gemini 3 Flash on each page and convert output to our schema
     pages: List[Page] = []
     markdown_parts: List[str] = []
-    csv_rows: List[str] = []
+    all_line_items: List[LineItem] = []
     for idx, img in enumerate(images, start=1):
         ocr_output = await asyncio.to_thread(run_gemini_ocr_on_image, img, page_number=idx)
         page = convert_elements_to_page(ocr_output, page_number=idx, img_width=img.width, img_height=img.height)
@@ -364,15 +484,12 @@ async def process_invoice_file(file: UploadFile, max_pages: int) -> OcrResponse:
         page_markdown = ocr_output.get("markdown", "")
         if page_markdown:
             markdown_parts.append(page_markdown)
-        page_csv = ocr_output.get("csv", "")
-        if page_csv:
-            for line in page_csv.strip().splitlines():
-                if line.strip().lower() == CSV_HEADER.lower():
-                    continue
-                if line.strip():
-                    csv_rows.append(line.strip())
-
-    csv_output = CSV_HEADER + "\n" + "\n".join(csv_rows) if csv_rows else CSV_HEADER
+        page_items = ocr_output.get("line_items", [])
+        for item_dict in page_items:
+            try:
+                all_line_items.append(LineItem(**item_dict))
+            except Exception:
+                pass  # Skip malformed items
 
     metadata = OcrMetadata(
         source_type=source_type,
@@ -384,7 +501,7 @@ async def process_invoice_file(file: UploadFile, max_pages: int) -> OcrResponse:
         pages=pages,
         metadata=metadata,
         markdown="\n\n".join(markdown_parts),
-        csv=csv_output,
+        line_items=all_line_items,
     )
 
 
