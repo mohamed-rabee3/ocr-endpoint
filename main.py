@@ -3,6 +3,7 @@ import io
 import itertools
 import json
 import os
+import re
 import threading
 from typing import List, Literal, Optional, Union
 
@@ -143,6 +144,7 @@ class LineItem(BaseModel):
     goods_products: str = ""
     quantity: str = ""
     unit_price: str = ""
+    currency: str = ""
     whole_price_amount: str = ""
     total_price: str = ""
 
@@ -249,25 +251,59 @@ def _extract_response_text(response) -> str:
     return ""
 
 
-LINE_ITEM_FIELDS = ["company_from", "company_to", "invoice_number", "goods_products", "quantity", "unit_price", "whole_price_amount", "total_price"]
+LINE_ITEM_FIELDS = ["company_from", "company_to", "invoice_number", "goods_products", "quantity", "unit_price", "currency", "whole_price_amount", "total_price"]
+
+
+def _normalize_currency(raw_currency: str) -> str:
+    if not raw_currency:
+        return ""
+    val = raw_currency.strip()
+    upper_val = val.upper()
+    compact = upper_val.replace(" ", "").replace(".", "")
+    if upper_val in {"$", "US$"} or "USD" in upper_val:
+        return "USD"
+    if "E£" in val or "EGP" in upper_val or compact == "LE":
+        return "EGP"
+    if re.search(r"(^|[^A-Z])L\.?\s*E\.?([^A-Z]|$)", upper_val):
+        return "EGP"
+    return ""
+
+
+def _extract_currency_from_price(raw_price: str) -> str:
+    if not raw_price:
+        return ""
+    upper_price = raw_price.upper()
+    if "US$" in upper_price or "$" in raw_price or "USD" in upper_price:
+        return "USD"
+    if "E£" in raw_price or "EGP" in upper_price:
+        return "EGP"
+    if re.search(r"(^|[^A-Z])L\.?\s*E\.?([^A-Z]|$)", upper_price):
+        return "EGP"
+    return ""
 
 
 def _normalize_line_items(raw_items: list) -> List[dict]:
-    """Sanitize line items: strip $ from prices, ensure all fields present."""
+    """Sanitize line items: normalize currency, clean prices, ensure all fields present."""
     result = []
     for item in raw_items:
         if not isinstance(item, dict):
             continue
+        raw_currency = str(item.get("currency", "")).strip()
+        normalized_currency = _normalize_currency(raw_currency)
+        unit_price_raw = str(item.get("unit_price", "")).strip()
+        inferred_currency = _extract_currency_from_price(unit_price_raw)
+        effective_currency = normalized_currency or inferred_currency
         cleaned = {}
         for field in LINE_ITEM_FIELDS:
+            if field == "currency":
+                cleaned[field] = effective_currency
+                continue
             val = str(item.get(field, "")).strip()
             # Strip $ and commas from price fields
             if field in ("unit_price", "whole_price_amount", "total_price") and val:
-                # Remove currency prefixes like $, US$, USD
-                for prefix in ("US$", "USD", "$"):
-                    if val.upper().startswith(prefix.upper()):
-                        val = val[len(prefix):].strip()
-                        break
+                # Remove known currency prefixes/suffixes around prices.
+                val = re.sub(r"^\s*(US\$|USD|\$|E£|EGP|L\.?\s*E\.?)\s*", "", val, flags=re.IGNORECASE)
+                val = re.sub(r"\s*(US\$|USD|\$|E£|EGP|L\.?\s*E\.?)\s*$", "", val, flags=re.IGNORECASE)
                 try:
                     float(val.replace(",", ""))
                     val = val.replace(",", "")
@@ -374,6 +410,7 @@ Each line item must be a JSON object with exactly these fields:
 - "goods_products": description of the goods/product for this line item
 - "quantity": the quantity
 - "unit_price": the unit price for this line item (number only, no currency symbol)
+- "currency": currency code for the unit price. Must be "USD" or "EGP". If unavailable, use ""
 - "whole_price_amount": the line-item total / amount (number only, no currency symbol). If "FOC" or "Free", keep as-is.
 - "total_price": the invoice grand total (same value on every row, number only, no currency symbol)
 
@@ -381,6 +418,7 @@ Rules:
 - One object per line item found in the invoice. Do NOT include total/summary rows.
 - company_from, company_to, invoice_number, and total_price are document-level fields — repeat them on every item.
 - Copy numbers exactly as they appear in the document. Do not recalculate or reformat.
+- currency must be either "USD" or "EGP". If not present or unclear in the source, set it to "".
 - If a field does not exist in the document, set it to an empty string "".
 - If a value is "FOC", "Free", "N/A" etc., keep it as-is.
 - Translate non-English item descriptions to English.
