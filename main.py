@@ -22,7 +22,7 @@ from PIL import Image
 # Load environment variables from .env (with .env taking precedence if both are set)
 load_dotenv(override=True)
 
-GEMINI_MODEL_NAME = "gemma-4-31b-it"
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 
 def _load_gemini_api_keys() -> List[str]:
     keys = []
@@ -158,7 +158,7 @@ class OcrResponse(BaseModel):
 
 app = FastAPI(
     title="Invoice OCR API",
-    description="OCR invoice images via Gemini 3 Flash (Google AI).",
+    description="OCR invoice images via Gemini API (Google AI).",
     version="0.1.0",
 )
 
