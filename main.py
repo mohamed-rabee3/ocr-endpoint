@@ -22,7 +22,7 @@ from PIL import Image
 # Load environment variables from .env (with .env taking precedence if both are set)
 load_dotenv(override=True)
 
-GEMINI_MODEL_NAME = "gemini-3-flash-preview"
+GEMINI_MODEL_NAME = "gemma-4-31b-it"
 
 def _load_gemini_api_keys() -> List[str]:
     keys = []
